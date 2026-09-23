@@ -465,7 +465,7 @@ func TestRunner_RunLive_FlushesBufferedEventsAtEOF(t *testing.T) {
 		t.Fatalf("RunLive() yielded %d events, want partial transcription and buffered call", len(received))
 	}
 	if received[1] != bufferedCall {
-		t.Fatalf("RunLive() second event = %v, want buffered function call", received[1])
+		t.Fatal("RunLive() second event is not the buffered function call")
 	}
 
 	events := getRunLiveTestEvents(t, sessionService, sessionID)
@@ -474,7 +474,7 @@ func TestRunner_RunLive_FlushesBufferedEventsAtEOF(t *testing.T) {
 	}
 	content := events.At(0).LLMResponse.Content
 	if content == nil || len(content.Parts) != 1 || content.Parts[0].FunctionCall == nil || content.Parts[0].FunctionCall.Name != "book_flight" {
-		t.Fatalf("persisted event = %v, want book_flight function call", events.At(0))
+		t.Fatal("persisted event does not contain the expected function call")
 	}
 }
 
@@ -545,10 +545,24 @@ func (s *failingLiveAppendService) AppendEvent(ctx context.Context, sess session
 	return s.Service.AppendEvent(ctx, sess, event)
 }
 
+// contextBoundLiveAppendService models database and VertexAI writes, which
+// honor cancellation instead of ignoring it like the in-memory service.
+type contextBoundLiveAppendService struct {
+	session.Service
+}
+
+func (s *contextBoundLiveAppendService) AppendEvent(ctx context.Context, sess session.Session, event *session.Event) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return s.Service.AppendEvent(ctx, sess, event)
+}
+
 func TestRunner_RunLive_BufferedEventExits(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
 		nilEvent    bool
+		cancelRun   bool
 		failAppend  bool
 		stopOnError bool
 		stopOnCall  bool
@@ -556,6 +570,9 @@ func TestRunner_RunLive_BufferedEventExits(t *testing.T) {
 		wantSaved   []string
 		wantErrors  int
 	}{
+		{name: "cancelled context preserves buffered events", cancelRun: true, wantIDs: []string{"partial", "later", "call", "response"}, wantSaved: []string{"later", "call", "response"}, wantErrors: 1},
+		{name: "cancelled context consumer stops on error", cancelRun: true, stopOnError: true, wantIDs: []string{"partial", "later"}, wantSaved: []string{"later"}, wantErrors: 1},
+		{name: "cancelled context consumer stops during flush", cancelRun: true, stopOnCall: true, wantIDs: []string{"partial", "later", "call"}, wantSaved: []string{"later", "call"}, wantErrors: 1},
 		{name: "EOF preserves order and timestamps", wantIDs: []string{"partial", "later", "call", "response"}, wantSaved: []string{"later", "call", "response"}},
 		{name: "nil event reports dropped buffer", nilEvent: true, wantIDs: []string{"partial", "later"}, wantSaved: []string{"later"}, wantErrors: 1},
 		{name: "nil event consumer stops", nilEvent: true, stopOnError: true, wantIDs: []string{"partial", "later"}, wantSaved: []string{"later"}, wantErrors: 1},
@@ -565,6 +582,8 @@ func TestRunner_RunLive_BufferedEventExits(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			const sessionID = "bufferedExits"
+			runCtx, cancel := context.WithCancel(t.Context())
+			defer cancel()
 			start := time.Date(2026, time.September, 1, 0, 0, 0, 0, time.UTC)
 			timestamps := map[string]time.Time{
 				"partial": start, "call": start.Add(time.Second),
@@ -591,16 +610,23 @@ func TestRunner_RunLive_BufferedEventExits(t *testing.T) {
 							return
 						}
 					}
+					if tc.cancelRun {
+						// The live producer reports cancellation before closing its iterator.
+						cancel()
+						yield(nil, runCtx.Err())
+						return
+					}
 					if tc.nilEvent && yield(nil, nil) {
 						t.Error("runner continued upstream after nil event")
 					}
 				}
 			})
+			r.sessionService = &contextBoundLiveAppendService{Service: service}
 			appendErr := errors.New("session storage unavailable")
 			if tc.failAppend {
 				r.sessionService = &failingLiveAppendService{Service: service, failID: "call", err: appendErr}
 			}
-			_, stream, err := r.RunLive(t.Context(), "testUser", sessionID, agent.LiveRunConfig{})
+			_, stream, err := r.RunLive(runCtx, "testUser", sessionID, agent.LiveRunConfig{})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -621,6 +647,10 @@ func TestRunner_RunLive_BufferedEventExits(t *testing.T) {
 							if !strings.Contains(err.Error(), part) {
 								t.Errorf("error %q does not identify %q", err, part)
 							}
+						}
+					} else if tc.cancelRun {
+						if !errors.Is(err, context.Canceled) {
+							t.Errorf("error = %v, want context cancellation", err)
 						}
 					} else if !errors.Is(err, appendErr) {
 						t.Errorf("error = %v, want wrapped append error", err)

@@ -1053,10 +1053,13 @@ func (r *Runner) RunLive(ctx context.Context, userID, sessionID string, cfg agen
 			}
 		}
 
-		// Reaching here means innerIter exhausted naturally. Every downstream
-		// stop returns from wrappedIter above, so buffered events are safe to flush.
+		// innerIter has returned; every downstream stop above returns from wrappedIter.
+		// Live agents reach here when their session closes, including on cancellation.
+		// Python persists live events as they arrive; Go buffers them during transcription.
+		// Detach cancellation so session teardown can still persist that buffer.
+		flushCtx := context.WithoutCancel(iCtx)
 		for _, bufferedEvent := range bufferedEvents {
-			if err := r.sessionService.AppendEvent(iCtx, storedSession, bufferedEvent); err != nil {
+			if err := r.sessionService.AppendEvent(flushCtx, storedSession, bufferedEvent); err != nil {
 				if !yield(nil, fmt.Errorf("failed to add event to session: %w", err)) {
 					return
 				}
