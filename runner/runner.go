@@ -1057,6 +1057,8 @@ func (r *Runner) RunLive(ctx context.Context, userID, sessionID string, cfg agen
 		// Live agents reach here when their session closes, including on cancellation.
 		// Python persists live events as they arrive; Go buffers them during transcription.
 		// Detach cancellation so session teardown can still persist that buffer.
+		// Match the mid-stream flush's persistence policy for buffered tool events,
+		// including those carrying inline data.
 		flushCtx := context.WithoutCancel(iCtx)
 		for _, bufferedEvent := range bufferedEvents {
 			if err := r.sessionService.AppendEvent(flushCtx, storedSession, bufferedEvent); err != nil {
